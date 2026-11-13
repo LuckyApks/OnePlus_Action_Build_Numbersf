@@ -209,7 +209,32 @@ jobs:
           git config --global user.name "Numbersf"
           git config --global user.email "263623064@qq.com"
           mkdir kernel_workspace && cd kernel_workspace
-          git clone https://github.com/Numbersf/Action-Build.git -b KernelSU
+
+          UPSTREAM_REPO="Numbersf/Action-Build"
+          UPSTREAM_BRANCH="KernelSU"
+          SELF_REPO="${{ github.repository }}"
+          SELF_BRANCH="${{ github.ref_name }}"
+
+          USE_REPO="$UPSTREAM_REPO"
+          USE_BRANCH="$UPSTREAM_BRANCH"
+
+          if [ "${SELF_REPO,,}" != "${UPSTREAM_REPO,,}" ]; then
+            git clone --filter=blob:none --no-checkout "https://github.com/${SELF_REPO}.git" -b "$SELF_BRANCH" probe
+            cd probe
+            git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+            git fetch --filter=blob:none upstream "$UPSTREAM_BRANCH"
+
+            AHEAD=$(git rev-list --no-merges --count "upstream/${UPSTREAM_BRANCH}..HEAD")
+            echo "fork 独有的非 Merge 提交数: $AHEAD"
+
+            if [ "$AHEAD" -gt 0 ]; then
+              USE_REPO="$SELF_REPO"
+              USE_BRANCH="$SELF_BRANCH"
+            fi
+            cd .. && rm -rf probe
+          fi
+          echo "使用仓库: $USE_REPO @ $USE_BRANCH"
+          git clone "https://github.com/${USE_REPO}.git" -b "$USE_BRANCH" Action-Build
 
       - name: Extract Manifest Info
         id: extract_info
@@ -682,11 +707,6 @@ jobs:
           echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
           sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Kbuild
 
-      - name: Apply Fake Patches
-        if: ${{ github.event.inputs.SUSFS_META != '-1' }}
-        run: |
-          kotlin "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/PatchFakePatches.kts" apply "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common"
-
       - name: Apply Patches KernelSU
         env:
           FILE: ${{ github.event.inputs.FILE }}
@@ -739,6 +759,9 @@ jobs:
           else
             cd ./common
           fi
+          if [ "${{ github.event.inputs.SUSFS_META }}" != "-1" ]; then
+            kotlin "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/SusfsCompat.kts" apply "$PWD"
+          fi
 
           if [ "$KMI" == "android13-5.15" ] && [ "$SUBLEVEL" -lt 123 ]; then
             echo "修复内核版本为5.15.0~5.15.123仅支持旧版C库造成的一些bug"
@@ -749,17 +772,17 @@ jobs:
 
           if [ "${{ github.event.inputs.SUSFS_META }}" != "-1" ]; then
             echo "正在打susfs补丁"
+            kotlin "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/SusfsContext.kts" "$PWD" "$PWD/50_add_susfs_in_gki-${{ env.KANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch"
             patch -p1 < 50_add_susfs_in_gki-${{ env.KANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
             echo "susfs_patch完成"
           fi
           source $REJ_CHECKER
           check_rejects .
 
-      - name: Revert and Postfix Fake Patches
-        if: ${{ github.event.inputs.SUSFS_META != '-1' }}
-        run: |
-          kotlin "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/PatchFakePatches.kts" postfix "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common"
-          kotlin "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/PatchFakePatches.kts" revert "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common"
+          if [ "${{ github.event.inputs.SUSFS_META }}" != "-1" ]; then
+            kotlin "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/SusfsCompat.kts" postfix "$PWD"
+            kotlin "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/SusfsCompat.kts" revert "$PWD"
+          fi
 
       # OGKI转换GKI，无需修改 dtbo 开机
       - name: Apply Convert HMBIRD_OGKI to HMBIRD_GKI
@@ -1163,6 +1186,16 @@ jobs:
         run: |
           echo "Disabling GPUEB for MTK kernel 5.10"
           sed -i '/obj-y.*gpueb/d' kernel_workspace/kernel-5.10/drivers/gpu/mediatek/Makefile
+
+      - name: Fix libbpf for new glibc
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          f="./tools/lib/bpf/libbpf.c"
+          if [ -f "$f" ]; then
+            sed -i -E 's/(\bres = )strstr\(sym_name, "\.llvm\."\)/\1(char *)strstr(sym_name, ".llvm.")/' "$f"
+            sed -i -E 's/(\bnext_path = )strchr\(s, '"'"':'"'"'\)/\1(char *)strchr(s, '"'"':'"'"')/' "$f"
+            grep -nE '\(char \*\)(strstr|strchr)' "$f" || echo "✅ 匹配失败，当前云控ubuntu版本无需此操作"
+          fi
 
       - name: Build Kernel FAST
         if: ${{ github.event.inputs.FAST_BUILD == 'true' }}
